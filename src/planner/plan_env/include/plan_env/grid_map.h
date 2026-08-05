@@ -4,7 +4,13 @@
 #include <Eigen/Eigen>
 #include <Eigen/StdVector>
 #include <algorithm>
+// cv_bridge moved its headers to .hpp in Iron and dropped the .h form in
+// Jazzy; keep building on Humble as well.
+#if __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>
+#else
 #include <cv_bridge/cv_bridge.h>
+#endif
 #include <cmath>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <iostream>

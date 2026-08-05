@@ -195,24 +195,28 @@ namespace scan_planner
 
   bool SCANReplanFSM::planGlobalTrajByWaypoints(const std::vector<Eigen::Vector3d> &waypoints)
   {
-    if (waypoints.empty())
+    if (waypoints.size() < 2)
     {
-      RCLCPP_WARN(node_->get_logger(), "No waypoint supplied for global trajectory");
+      RCLCPP_WARN(node_->get_logger(), "Reference path requires at least two points.");
       return false;
     }
 
     end_pt_ = waypoints.back();
+    std::vector<Eigen::Vector3d> reference_waypoints(waypoints.begin() + 1, waypoints.end());
 
     for (size_t i = 0; i < waypoints.size(); i++)
     {
       visualization_->displayGoalPoint(waypoints[i], Eigen::Vector4d(0, 0.5, 0.5, 1), 0.3, i);
     }
 
+    // Seed the global trajectory on the reference path itself rather than on the
+    // current odometry state; starting from the robot's pose and velocity is what
+    // pulled the trajectory into obstacles in reference-path mode.
     bool success = planner_manager_->planGlobalTrajWaypoints(
-        odom_pos_,
-        odom_vel_,
+        waypoints.front(),
         Eigen::Vector3d::Zero(),
-        waypoints,
+        Eigen::Vector3d::Zero(),
+        reference_waypoints,
         Eigen::Vector3d::Zero(),
         Eigen::Vector3d::Zero());
 
@@ -345,19 +349,44 @@ namespace scan_planner
       return;
     }
 
+    if (!have_odom_)
+    {
+      RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                           "No odometry yet, cannot plan global trajectory.");
+      return;
+    }
+
     trigger_ = true;
+    end_pt_ << msg->poses.back().pose.position.x,
+        msg->poses.back().pose.position.y,
+        msg->poses.back().pose.position.z + body_height_;
 
     std::vector<Eigen::Vector3d> waypoints;
     waypoints.reserve(msg->poses.size());
+    // Thin the path out: reference paths are usually sampled far more densely
+    // than the global trajectory needs.
+    constexpr double min_dist = 0.5;
+    Eigen::Vector3d last_wp;
+    bool first = true;
 
-    for (const auto& pose_stamped : msg->poses)
+    for (const auto &pose_stamped : msg->poses)
     {
       Eigen::Vector3d wp;
       wp(0) = pose_stamped.pose.position.x;
       wp(1) = pose_stamped.pose.position.y;
       wp(2) = pose_stamped.pose.position.z + body_height_; // Adjust for body height
-      waypoints.push_back(wp);
+
+      if (first || (wp - last_wp).norm() >= min_dist)
+      {
+        waypoints.push_back(wp);
+        last_wp = wp;
+        first = false;
+      }
     }
+
+    if ((waypoints.back() - end_pt_).norm() > 1e-6)
+      waypoints.push_back(end_pt_);
+
     bool success = planGlobalTrajByWaypoints(waypoints);
 
     if (success)
@@ -731,6 +760,30 @@ namespace scan_planner
 
     //cout << "info->velocity_traj_=" << info->velocity_traj_.get_control_points() << endl;
 
+    // In reference-path mode the global trajectory carries the supplied route, so
+    // it must not be regenerated from odometry to the goal. Re-seed from the
+    // trajectory itself and only redo the local rebound optimisation.
+    if (navi_mode_ == NAVI_MODE::REFERENCE_PATH)
+    {
+      start_pt_ = info->position_traj_.evaluateDeBoorT(t_cur);
+      start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
+      start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
+
+      bool success = callReboundReplan(false, false);
+      if (!success)
+      {
+        success = callReboundReplan(true, false);
+        if (!success)
+        {
+          success = callReboundReplan(true, true);
+          if (!success)
+            return false;
+        }
+      }
+
+      return true;
+    }
+
     start_pt_ = odom_pos_;
     start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
     start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
@@ -928,44 +981,47 @@ namespace scan_planner
 
   void SCANReplanFSM::getLocalTarget()
   {
-    double t;
+    const double max_vel = planner_manager_->pp_.max_vel_;
+    const double max_acc = planner_manager_->pp_.max_acc_;
+    const double duration = planner_manager_->global_data_.global_duration_;
+    double t_step = max_vel > 1e-6 ? planning_horizon_ / 20.0 / max_vel : 0.01;
+    t_step = std::max(t_step, 0.01);
 
-    double t_step = planning_horizon_ / 20 / planner_manager_->pp_.max_vel_;
-    double dist_min = 9999, dist_min_t = 0.0;
-    double target_t = planner_manager_->global_data_.global_duration_;
-    for (t = planner_manager_->global_data_.last_progress_time_; t < planner_manager_->global_data_.global_duration_; t += t_step)
+    // Project the start onto the global trajectory, then walk forward along it
+    // accumulating arc length until one planning horizon has been covered.
+    double t_proj = 0.0;
+    double min_dist_to_start = 9999.0;
+    for (double t = 0.0; t < duration; t += t_step)
     {
       Eigen::Vector3d pos_t = planner_manager_->global_data_.getPosition(t);
-      double dist = (pos_t - start_pt_).norm();
+      double dist_to_start = (pos_t - start_pt_).norm();
+      if (dist_to_start < min_dist_to_start)
+      {
+        min_dist_to_start = dist_to_start;
+        t_proj = t;
+      }
+    }
 
-      if (t < planner_manager_->global_data_.last_progress_time_ + 1e-5 && dist > planning_horizon_)
-      {
-        RCLCPP_ERROR(node_->get_logger(),
-                     "Local target progress mismatch: distance=%.3f horizon=%.3f progress_time=%.3f",
-                     dist, planning_horizon_, planner_manager_->global_data_.last_progress_time_);
-        local_target_pt_ = pos_t;
-        target_t = t;
-        planner_manager_->global_data_.last_progress_time_ = t;
-        break;
-      }
-      if (dist < dist_min)
-      {
-        dist_min = dist;
-        dist_min_t = t;
-      }
-      if (dist >= planning_horizon_)
-      {
-        local_target_pt_ = pos_t;
-        target_t = t;
-        planner_manager_->global_data_.last_progress_time_ = dist_min_t;
-        break;
-      }
-    }
-    if (t > planner_manager_->global_data_.global_duration_) // Last global point
+    double target_t = duration;
+    double total_dist = 0.0;
+    bool target_found = false;
+    Eigen::Vector3d prev_pos = planner_manager_->global_data_.getPosition(t_proj);
+    local_target_pt_ = end_pt_;
+
+    for (double t = t_proj; t < duration; t += t_step)
     {
-      local_target_pt_ = end_pt_;
-      target_t = planner_manager_->global_data_.global_duration_;
+      Eigen::Vector3d pos_t = planner_manager_->global_data_.getPosition(t);
+      total_dist += (pos_t - prev_pos).norm();
+      if (total_dist >= planning_horizon_)
+      {
+        local_target_pt_ = pos_t;
+        target_t = t;
+        target_found = true;
+        break;
+      }
+      prev_pos = pos_t;
     }
+    planner_manager_->global_data_.last_progress_time_ = target_found ? target_t : duration;
 
     auto targetOccupancy = [&](const Eigen::Vector3d &pt) {
       return planner_manager_->grid_map_->getInflateOccupancy(pt, estimateYawFromSegment(odom_pos_, pt));
@@ -992,7 +1048,7 @@ namespace scan_planner
         }
 
         double t_backward = target_t - dt;
-        if (t_backward >= std::max(0.0, dist_min_t))
+        if (t_backward >= std::max(0.0, t_proj))
         {
           Eigen::Vector3d pt = planner_manager_->global_data_.getPosition(t_backward);
           if (targetOccupancy(pt) == 0)
@@ -1018,7 +1074,7 @@ namespace scan_planner
       }
     }
 
-    if ((end_pt_ - local_target_pt_).norm() < (planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_) / (2 * planner_manager_->pp_.max_acc_))
+    if ((end_pt_ - local_target_pt_).norm() < (max_vel * max_vel) / (2 * max_acc))
     {
       // local_target_vel_ = (end_pt_ - init_pt_).normalized() * planner_manager_->pp_.max_vel_ * (( end_pt_ - local_target_pt_ ).norm() / ((planner_manager_->pp_.max_vel_*planner_manager_->pp_.max_vel_)/(2*planner_manager_->pp_.max_acc_)));
       // cout << "A" << endl;
@@ -1027,6 +1083,8 @@ namespace scan_planner
     else
     {
       local_target_vel_ = planner_manager_->global_data_.getVelocity(target_t);
+      if (local_target_vel_.norm() > max_vel)
+        local_target_vel_ = local_target_vel_.normalized() * max_vel;
       // cout << "AA" << endl;
     }
   }
