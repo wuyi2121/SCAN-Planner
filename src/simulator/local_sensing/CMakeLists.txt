@@ -12,7 +12,6 @@ find_package(Boost REQUIRED COMPONENTS filesystem iostreams program_options syst
 find_package(cv_bridge REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(glm REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(OpenMP REQUIRED)
@@ -40,6 +39,7 @@ target_link_libraries(pcl_render_node
 
 set(renderer_targets pcl_render_node)
 if(USE_GPU)
+  find_package(glm REQUIRED)   # only the OpenGL renderer uses glm
   find_package(GLEW REQUIRED)
   find_package(OpenGL REQUIRED)
   find_package(glfw3 REQUIRED)
